@@ -43,14 +43,7 @@ class Attention(nn.Module):
         value: torch.Tensor,
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[AttentionMetadataPerStage],
-        
-        status: int,
-        cache_fuse_metadata: dict,
-        old_kv,
-        
         kv_scale: float = 1.0,
     ) -> torch.Tensor:
         return self.impl.forward(query, key, value, kv_cache, attn_metadata,
-                                 kv_scale,
-                                 status, cache_fuse_metadata, old_kv,
-                                 )
+                                 kv_scale)

@@ -27,6 +27,9 @@ from vllm.utils import (CudaMemoryProfiler, async_tensor_h2d, is_hip,
                         is_pin_memory_available, make_tensor_with_pad,
                         maybe_expand_dim)
 
+#from lmcache.cache_engine import LMCacheEngineBuilder
+#from lmcache_vllm import LMCVLLMDriver, broadcast_tokens_and_block_tables, broadcast_input_ids_list
+
 logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
@@ -157,6 +160,20 @@ class ModelRunner:
         # (max batch size to capture, max context len to capture / block size).
         self.graph_block_tables: torch.Tensor  # Set after initial profiling.
 
+        # Cache engine
+        # self.cache_engine = LMCacheEngineBuilder.get("vllm")
+        # self.lmcache_driver = LMCVLLMDriver(self.cache_engine, self.model_config, self.parallel_config, self.device)
+        
+        # HACK(Jiayi): Initialize the cache engine here
+        #from lmcache.cache_engine import LMCacheEngine
+        #from lmcache.config import LMCacheEngineConfig, LMCacheEngineMetadata
+        #config = LMCacheEngineConfig.from_file("../examples/example.yaml")
+        #meta = LMCacheEngineMetadata("mistralai/Mistral-7B-Instruct-v0.2", 1, 0, "vllm")
+        #self.cache_engine = LMCacheEngine(config, meta)
+        
+        #self.lmcache_driver = LMCVLLMDriver(self.cache_engine, self.model_config, self.parallel_config, self.device)
+        #self.hack_kvs = None
+
     def load_model(self) -> None:
         with CudaMemoryProfiler() as m:
             self.model = get_model(
@@ -211,6 +228,8 @@ class ModelRunner:
 
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
+        
+        #self.lmcache_driver.set_block_size(block_size)
 
         self.graph_block_tables = np.zeros(
             (max(_BATCH_SIZES_TO_CAPTURE), self.get_max_block_per_batch()),
@@ -223,6 +242,7 @@ class ModelRunner:
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        kv_caches: List[torch.Tensor],
     ) -> PreparePromptMetadata:
         input_tokens: List[int] = []
         input_positions: List[int] = []
@@ -236,6 +256,7 @@ class ModelRunner:
         subquery_lens: List[int] = []
         prefix_block_tables: List[List[int]] = []
         multi_modal_input_list: List[torch.Tensor] = []
+
 
         if len(seq_group_metadata_list) == 0:
             return PreparePromptMetadata.empty()
@@ -258,6 +279,14 @@ class ModelRunner:
             token_chunk_size = seq_group_metadata.token_chunk_size
             seq_data = seq_group_metadata.seq_data[seq_id]
             computed_len = seq_data.get_num_computed_tokens()
+
+            # Query Cache engine to get the cache
+            #loaded_block_nums = self.lmcache_driver.retrive(kv_caches, seq_group_metadata)
+            loaded_block_nums = []
+            
+            if len(loaded_block_nums) > 0:
+                computed_len = len(loaded_block_nums) * self.block_size
+
             # We should use get_len here because in case of preemption
             # it contains output tokens.
             prefill_end = min(seq_data.get_len(),
@@ -281,6 +310,8 @@ class ModelRunner:
                 else:
                     # The first prefill.
                     prefix_block_tables.append([])
+            elif len(loaded_block_nums) > 0:
+                prefix_block_tables.append(loaded_block_nums)
             else:
                 prefix_block_tables.append([])
                 # Right now, prefill start is always 0. However, this
@@ -651,6 +682,7 @@ class ModelRunner:
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        kv_caches: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, SamplingMetadata,
                Set[LoRARequest], LoRAMapping, torch.Tensor]:
         if self.is_driver_worker:
@@ -661,6 +693,8 @@ class ModelRunner:
                     prefill_reqs.append(seq_group_meta)
                 else:
                     decode_reqs.append(seq_group_meta)
+
+            #broadcast_tokens_and_block_tables(self.is_driver_worker, prefill_reqs, self.device)
 
             # Prepare input tensors.
             (
@@ -674,7 +708,7 @@ class ModelRunner:
                 lora_requests,
                 multi_modal_input,
                 slot_mapping,
-            ) = self._prepare_prompt(prefill_reqs)
+            ) = self._prepare_prompt(prefill_reqs, kv_caches)
             (
                 decode_input_tokens,
                 decode_input_positions,
@@ -762,6 +796,12 @@ class ModelRunner:
                 metadata_dict = decode_attn_metadata.asdict_zerocopy()
                 broadcast_tensor_dict(metadata_dict, src=0)
         else:
+            #tokens_and_block_tables = broadcast_tokens_and_block_tables(self.is_driver_worker, seq_group_metadata_list, self.device)
+            for element in tokens_and_block_tables:
+                tokens, block_table = element
+                #if self.cache_engine is not None and block_table is not None:
+                #    self.lmcache_driver.retrive_and_inject(kv_caches, tokens, block_table)
+
             metadata_dict = broadcast_tensor_dict(src=0)
             input_tokens = metadata_dict.pop("input_tokens")
             input_positions = metadata_dict.pop("input_positions")
@@ -824,7 +864,7 @@ class ModelRunner:
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_input
-         ) = self.prepare_input_tensors(seq_group_metadata_list)
+         ) = self.prepare_input_tensors(seq_group_metadata_list, kv_caches)
 
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
@@ -847,8 +887,35 @@ class ModelRunner:
             execute_model_kwargs.update({"image_input": multi_modal_input})
         hidden_states = model_executable(**execute_model_kwargs)
 
+        # HACK(Jiayi): only use cpu local store
+        # Cache engine: gather the kv cache and store it to cache engine
+        # if self.cache_engine is not None and \
+        #        attn_metadata.prefill_metadata is not None and \
+        #        not (attn_metadata.slot_mapping == -1).any():
+        #    input_ids_list = broadcast_input_ids_list(self.is_driver_worker, seq_group_metadata_list, self.device)
+
+        #    for idx, input_ids in enumerate(input_ids_list):
+        #        self.lmcache_driver.collect_kv_and_store(kv_caches, input_ids, attn_metadata, idx)
+        #if self.cache_engine is not None and \
+        #        attn_metadata.prefill_metadata is not None and \
+        #        not (attn_metadata.slot_mapping == -1).any() and \
+        #        self.model.model.cache_fuse_metadata['collect']:
+        #    input_ids_list = broadcast_input_ids_list(self.is_driver_worker, seq_group_metadata_list, self.device)
+            #for idx, input_ids in enumerate(input_ids_list):
+            #    self.hack_kvs = self.lmcache_driver.collect_kv(kv_caches, input_ids, attn_metadata, idx)        
+        
         # Compute the logits.
-        logits = self.model.compute_logits(hidden_states, sampling_metadata)
+        if self.model.model.cache_fuse_metadata['check']:
+            #import pdb
+            #pdb.set_trace()
+            temp_data = sampling_metadata.selected_token_indices.clone()
+            sampling_metadata.selected_token_indices[0] = hidden_states.shape[0]-1
+            self.model.model.cache_fuse_metadata['check'] = False
+            #pdb.set_trace()
+            logits = self.model.compute_logits(hidden_states, sampling_metadata)
+            sampling_metadata.selected_token_indices = temp_data
+        else:
+            logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
         # Only perform sampling in the driver worker.
         if not sampling_metadata.perform_sampling:

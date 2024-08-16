@@ -173,10 +173,6 @@ class XFormersImpl(AttentionImpl):
         kv_cache: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata[XFormersMetadata],
         kv_scale: float,
-        
-        status: int,
-        cache_fuse_metadata: dict,
-        old_kv,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
 
@@ -194,113 +190,34 @@ class XFormersImpl(AttentionImpl):
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        # Jiayi modified start
-        # TODO(Jiayi): The following `view`s can be saved
-        if status in [1, 2]:
-            key_old = old_kv[0].view(-1, self.num_kv_heads, self.head_size)
-            value_old = old_kv[1].view(-1, self.num_kv_heads, self.head_size)
-        
-        if status in [1]:
-            last_len = 1
-            topk_num = int((value.shape[0]-last_len)*cache_fuse_metadata["recomp_ratio"])
-
-            temp_diff = torch.sum((value[:-last_len,:,:]-value_old[:-last_len,:,:])**2, dim=[1,2])
-            top_indices = torch.topk(temp_diff, k=topk_num).indices
-            
-            # FIXME(Jiayi): Need changing to query len
-            for l in range(last_len):
-                temp_idx = num_tokens-(last_len-l)
-                top_indices = torch.cat([top_indices,torch.tensor([temp_idx], device=top_indices.device)])
-            #if num_tokens-1 not in top_indices:
-            #    top_indices = torch.cat([top_indices,torch.tensor([num_tokens-1], device=top_indices.device)])
-            #our_slot_mapping = attn_metadata.slot_mapping[top_indices]
-            #cache_fuse_metadata["our_slot_mapping"] = our_slot_mapping
-            query = query[top_indices]
-            cache_fuse_metadata["imp_indices"] = top_indices
-            
-            attn_bias = _make_partial_bias_gqa(cache_fuse_metadata, query.device, self.num_kv_heads, self.num_queries_per_kv)
-            cache_fuse_metadata["attn_bias"] = attn_bias
-            attn_metadata.prefill_metadata.attn_bias=None
-            
-        #if status in [0] and cache_fuse_metadata["original_slot_mapping"]==None and cache_fuse_metadata['check']:
-        #    cache_fuse_metadata["original_slot_mapping"] = attn_metadata.slot_mapping#.clone()
-        #    cache_fuse_metadata["key_shape"] = key.shape
-        #    cache_fuse_metadata["value_shape"] = value.shape
-        #    cache_fuse_metadata["kv_cache_string_dtype"] = "auto"
-        cache_fuse_metadata["kv_cache_dtype"] = value.dtype
-        
-        # Jiayi: whether partial update or full update at check layer
-        if status in [1]:
-            imp_indices = cache_fuse_metadata["imp_indices"]
-            #key_old[imp_indices] = key[imp_indices]
-            #value_old[imp_indices] = value[imp_indices]
-            #key = key_old
-            #value = value_old
-            
-        
-        if status in [2]:
-            imp_indices = cache_fuse_metadata["imp_indices"]
-            key_old[imp_indices] = key 
-            value_old[imp_indices] = value
-            key = key_old
-            value = value_old
-        
         if kv_cache is not None:
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
-            
 
-            #if status in [2]:
-                # TODO(Jiayi): This is full update/ Do we need partial update? 
-            #    PagedAttention.write_to_paged_cache(key, value, key_cache,
-            #                                        value_cache,
-            #                                        cache_fuse_metadata["our_slot_mapping"],
-            #                                        attn_metadata.kv_cache_dtype,
-            #                                        kv_scale)
-            #else:
             # Reshape the input keys and values and store them in the cache.
             # If kv_cache is not provided, the new key and value tensors are
             # not cached. This happens during the initial memory profiling run.
-            #    PagedAttention.write_to_paged_cache(key, value, key_cache,
-            #                                        value_cache,
-            #                                        attn_metadata.slot_mapping,
-            #                                        attn_metadata.kv_cache_dtype,
-            #                                        kv_scale)
             PagedAttention.write_to_paged_cache(key, value, key_cache,
                                                 value_cache,
                                                 attn_metadata.slot_mapping,
                                                 attn_metadata.kv_cache_dtype,
                                                 kv_scale)
-        
-        
-        # TODO(Jiayi): need to change num prefill tokens accordingly
-        if status in [1,2]:
-            num_prefill_tokens = attn_metadata.num_prefill_tokens
-            num_decode_tokens = attn_metadata.num_decode_tokens
-            output = torch.empty_like(query)
-            decode_query = None
-            query = query
-            key = key[:num_prefill_tokens]
-            value = value[:num_prefill_tokens]
-            
-            assert query.shape[0] == len(cache_fuse_metadata["imp_indices"])
-            #assert decode_query.shape[0] == num_decode_tokens
-        else:
-            num_prefill_tokens = attn_metadata.num_prefill_tokens
-            num_decode_tokens = attn_metadata.num_decode_tokens
-            assert key.shape[0] == num_prefill_tokens + num_decode_tokens
-            assert value.shape[0] == num_prefill_tokens + num_decode_tokens
 
-            output = torch.empty_like(query)
-            # Query for decode. KV is not needed because it is already cached.
-            decode_query = query[num_prefill_tokens:]
-            # QKV for prefill.
-            query = query[:num_prefill_tokens]
-            key = key[:num_prefill_tokens]
-            value = value[:num_prefill_tokens]
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        assert key.shape[0] == num_prefill_tokens + num_decode_tokens
+        assert value.shape[0] == num_prefill_tokens + num_decode_tokens
 
-            assert query.shape[0] == num_prefill_tokens
-            assert decode_query.shape[0] == num_decode_tokens
+        output = torch.empty_like(query)
+        # Query for decode. KV is not needed because it is already cached.
+        decode_query = query[num_prefill_tokens:]
+        # QKV for prefill.
+        query = query[:num_prefill_tokens]
+        key = key[:num_prefill_tokens]
+        value = value[:num_prefill_tokens]
+
+        assert query.shape[0] == num_prefill_tokens
+        assert decode_query.shape[0] == num_decode_tokens
 
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
@@ -308,13 +225,10 @@ class XFormersImpl(AttentionImpl):
                 # normal attention.
                 # block tables are empty if the prompt does not have a cached
                 # prefix.
-                
                 out = self._run_memory_efficient_xformers_forward(
-                    query, key, value, prefill_meta, status, cache_fuse_metadata)
-                
-                #assert out.shape == output[:num_prefill_tokens].shape
-                #output[:num_prefill_tokens] = out
-                output = out
+                    query, key, value, prefill_meta)
+                assert out.shape == output[:num_prefill_tokens].shape
+                output[:num_prefill_tokens] = out
             else:
                 # prefix-enabled attention
                 # TODO(Hai) this triton kernel has regression issue (broke) to
@@ -360,8 +274,6 @@ class XFormersImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: XFormersMetadata,
-        status,
-        cache_fuse_metadata,
     ) -> torch.Tensor:
         """Attention for 1D query of multiple prompts. Multiple prompt
         tokens are flattened in to `query` input.
@@ -396,20 +308,12 @@ class XFormersImpl(AttentionImpl):
         # FIXME(woosuk): This is a hack.
         if attn_metadata.attn_bias is None:
             if self.alibi_slopes is None:
-                # TODO(Jiayi): please pre-allocate mask for faster inference
-                #if cache_fuse_metadata["check"]:
-                #    attn_metadata.attn_bias = _fetch_maetrailized_mask_gqa(query.shape[0], self.num_kv_heads, self.num_queries_per_kv, query.device,query.dtype)
-                #else:
-                attn_metadata.attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                                                attn_metadata.prompt_lens)
-                '''
                 attn_bias = BlockDiagonalCausalMask.from_seqlens(
                     attn_metadata.prompt_lens)
                 if self.sliding_window is not None:
                     attn_bias = attn_bias.make_local_attention(
                         self.sliding_window)
                 attn_metadata.attn_bias = [attn_bias]
-                '''
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(
                     self.alibi_slopes, self.num_kv_heads, query.dtype,
@@ -423,27 +327,6 @@ class XFormersImpl(AttentionImpl):
             query = query.unsqueeze(0)
             key = key.unsqueeze(0)
             value = value.unsqueeze(0)
-            
-            if status in [1,2]:
-                #import pdb
-                #pdb.set_trace()
-                out = xops.memory_efficient_attention_forward(
-                        query,
-                        key,
-                        value,
-                        attn_bias=cache_fuse_metadata["attn_bias"],
-                        p=0.0,
-                        scale=self.scale,
-                    )
-            else:
-                out = xops.memory_efficient_attention_forward(
-                query,
-                key,
-                value,
-                attn_bias=attn_metadata.attn_bias,
-                p=0.0,
-                scale=self.scale)
-            '''
             out = xops.memory_efficient_attention_forward(
                 query,
                 key,
@@ -451,8 +334,6 @@ class XFormersImpl(AttentionImpl):
                 attn_bias=attn_metadata.attn_bias[0],
                 p=0.0,
                 scale=self.scale)
-            '''
-            
             return out.view_as(original_query)
 
         # Attention with alibi slopes.
@@ -510,63 +391,3 @@ def _make_alibi_bias(
         attn_biases.append(LowerTriangularMaskWithTensorBias(bias))
 
     return attn_biases
-
-def _make_partial_bias_gqa(cache_fuse_metadata, 
-                       device,
-                       num_kv_heads,
-                       num_queries_per_kv,):
-    seq_len = cache_fuse_metadata['org_seq_len']
-    padded_len = (seq_len + 7) // 8 * 8
-    dtype = cache_fuse_metadata['kv_cache_dtype']
-    imp_indices = cache_fuse_metadata['imp_indices']
-    attn_mask = torch.triu(torch.ones(padded_len,
-                                      padded_len,
-                                      dtype=dtype,
-                                      device=device),
-                           diagonal=1)
-    #FIXME(Jiayi): The first 1 (bsz) is a hack
-    attn_mask = (attn_mask * torch.finfo(dtype).min).view(1, 
-                                                          1, 1, padded_len, padded_len) #FIXME(Jiayi): Now only focus on bsz=1
-    attn_mask = attn_mask[:,:,:,imp_indices]
-    attn_mask = attn_mask.expand(1,
-                                 num_kv_heads,num_queries_per_kv,-1,-1)
-    #import pdb
-    #pdb.set_trace()
-    attn_mask_padded = torch.empty(
-        1,
-        num_kv_heads,
-        num_queries_per_kv,
-        len(imp_indices),
-        padded_len,
-        device=device,
-        dtype=dtype,
-    ).copy_(attn_mask)[:, :, :, :, :seq_len]
-    #attn_mask_padded = LowerTriangularMaskWithTensorBias(attn_mask_padded)
-    return attn_mask_padded
-
-def _fetch_maetrailized_mask_gqa(q_len,num_kv_heads,num_queries_per_kv,device,dtype):
-    seq_len = q_len
-    padded_len = (seq_len + 7) // 8 * 8
-    attn_mask = torch.triu(torch.ones(seq_len,
-                                      padded_len,
-                                      dtype=dtype,
-                                      device=device),
-                           diagonal=1)
-    #FIXME(Jiayi): The first 1 (bsz) is a hack
-    attn_mask = (attn_mask * torch.finfo(dtype).min).view(#1,
-                                                          1, 1, seq_len, padded_len) #FIXME(Jiayi): Now only focus on bsz=1
-    attn_mask = attn_mask.expand(#1,
-                                 num_kv_heads, num_queries_per_kv,-1,-1)
-    
-    attn_mask_padded = torch.empty(
-        #1,
-        num_kv_heads,
-        num_queries_per_kv,
-        seq_len,
-        padded_len,
-        device=device,
-        dtype=dtype,
-    ).copy_(attn_mask)[#:, 
-                       :, :, :, :seq_len]
-    #attn_mask_padded = LowerTriangularMaskWithTensorBias(attn_mask_padded)
-    return attn_mask_padded

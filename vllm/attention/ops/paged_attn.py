@@ -78,6 +78,25 @@ class PagedAttention:
             kv_cache_dtype,
             kv_scale,
         )
+    
+    @staticmethod
+    def write_to_paged_cache_blend(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        cache_fuse_metadata,
+        kv_scale: float,
+    ) -> None:
+        ops.reshape_and_cache(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            cache_fuse_metadata["original_slot_mapping"].flatten(),
+            cache_fuse_metadata["kv_cache_string_dtype"],
+            kv_scale,
+        )
 
     @staticmethod
     def forward_decode(

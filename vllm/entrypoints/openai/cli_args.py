@@ -118,5 +118,12 @@ def make_arg_parser():
         "If a class is provided, vLLM will add it to the server "
         "using app.add_middleware(). ")
 
+    # LMCache related arguments
+    parser.add_argument(
+        "--lmcache-config-file",
+        type=str,
+        default=None,
+        help="The path to the lmcache configuration yaml file. Empty means disabling the lmcache")
+
     parser = AsyncEngineArgs.add_cli_args(parser)
     return parser
